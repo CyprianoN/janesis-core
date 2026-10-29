@@ -1,0 +1,2 @@
+# Placeholder. Cloud Run service configuration is IADP Phase 10 (first deployable milestone).
+# Concurrency, min/max instances, CPU, memory and probes are load-tested parameters and are not set here yet.

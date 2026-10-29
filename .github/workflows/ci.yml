@@ -1,0 +1,128 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CI: true
+  GITLEAKS_VERSION: 8.21.2
+
+jobs:
+  secrets-scan:
+    name: secrets-scan (gitleaks)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # TODO(pin): replace version tags with reviewed commit SHAs before this workflow is required.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks (pinned version, checksum verified)
+        run: |
+          set -euo pipefail
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o gitleaks.tar.gz "${base}/${archive}"
+          curl -fsSL -o checksums.txt "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          expected="$(grep -E "${archive}\$" checksums.txt | cut -d' ' -f1)"
+          test -n "${expected}"
+          echo "${expected}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks version
+      - name: Scan full git history
+        run: >
+          ./gitleaks detect --source . --redact --verbose --exit-code 1
+          --report-format sarif --report-path gitleaks.sarif
+      - name: Upload redacted report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: gitleaks.sarif
+
+  verify:
+    name: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # TODO(pin): replace version tags with reviewed commit SHAs before this workflow is required.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Require a committed lockfile
+        run: |
+          test -f package-lock.json || {
+            echo "package-lock.json is missing. Run npm install locally and commit it." >&2
+            exit 1
+          }
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: package.json
+          cache: npm
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run test:coverage
+      - run: npm run build
+      - run: npm run audit:deps
+
+  docker:
+    name: docker
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # TODO(pin): replace version tags with reviewed commit SHAs before this workflow is required.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Build image
+        run: docker build -t janesis-core:ci .
+      - name: Start container
+        run: docker run -d --name smoke -p 8080:8080 janesis-core:ci
+      - name: Wait for liveness
+        run: |
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8080/health && exit 0
+            sleep 1
+          done
+          echo "container did not become healthy" >&2
+          docker logs smoke
+          exit 1
+      - name: Check readiness
+        run: curl -fsS http://127.0.0.1:8080/ready
+      - name: Graceful shutdown on SIGTERM
+        run: |
+          docker stop --time 10 smoke
+          code="$(docker inspect smoke --format '{{.State.ExitCode}}')"
+          docker logs smoke
+          test "${code}" = "0"
+          docker logs smoke 2>&1 | grep -q 'shutdown started'
+      - name: Cleanup
+        if: always()
+        run: docker rm -f smoke || true
+
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [secrets-scan, verify, docker]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every job to succeed
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}" = "true" ]; then
+            echo "One or more required jobs did not succeed." >&2
+            exit 1
+          fi
