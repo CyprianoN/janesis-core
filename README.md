@@ -137,3 +137,27 @@ This documentation presents the platform's architecture and engineering approach
 6. **Continuous Evolution** — Strengthen the platform through iterative engineering, verification, and architectural review.
 
 ---
+
+## Set up Requirements
+
+**Requirements:** Node.js 22 or later and npm.
+
+### Setup
+
+Install dependencies:
+
+```bash
+npm ci
+```
+
+### Scripts
+
+| **Script**              | **Purpose**                                                    |
+| ----------------------- | -------------------------------------------------------------- |
+| `npm run format:check`  | Prettier formatting check                                      |
+| `npm run lint`          | ESLint, including dependency-boundary rules                    |
+| `npm run typecheck`     | Type-check source and tests                                    |
+| `npm test`              | Unit and architecture tests using `node:test`                  |
+| `npm run test:coverage` | Run tests with coverage reporting                              |
+| `npm run build`         | Compile TypeScript to `dist/`                                  |
+| `npm run audit:deps`    | Audit dependencies for high-severity vulnerabilities and above |
