@@ -17,15 +17,15 @@ Designed around separation of concerns and explicit component contracts, Janesis
 
 Janesis Core adopts a modular, layered architecture informed by Clean Architecture and Hexagonal Architecture principles. Each layer has a defined responsibility, with explicit boundaries governing interactions between application logic, transport mechanisms, and infrastructure implementations.
 
-| Layer / Component | Responsibility |
-| :--- | :--- |
-| **Transport Layer** | Handles incoming transport protocols, routing, and service interfaces. |
-| **Application Layer** | Coordinates application workflows and use-case interactions. |
-| **Domain Layer** | Encapsulates core domain business rules and preserves domain independence from technical frameworks. |
-| **Infrastructure Ports** | Define explicit contracts for technical capabilities required by the application layer. |
-| **Infrastructure Adapters** | Encapsulate technical implementations behind established contracts. |
-| **Bootstrap Layer** | Composes application components and manages runtime dependency injection. |
-| **Configuration Layer** | Centralizes environment configuration and validates required settings at startup. |
+| Layer / Component           | Responsibility                                                                                       |
+| :-------------------------- | :--------------------------------------------------------------------------------------------------- |
+| **Transport Layer**         | Handles incoming transport protocols, routing, and service interfaces.                               |
+| **Application Layer**       | Coordinates application workflows and use-case interactions.                                         |
+| **Domain Layer**            | Encapsulates core domain business rules and preserves domain independence from technical frameworks. |
+| **Infrastructure Ports**    | Define explicit contracts for technical capabilities required by the application layer.              |
+| **Infrastructure Adapters** | Encapsulate technical implementations behind established contracts.                                  |
+| **Bootstrap Layer**         | Composes application components and manages runtime dependency injection.                            |
+| **Configuration Layer**     | Centralizes environment configuration and validates required settings at startup.                    |
 
 This architecture establishes a foundation for independent testing, controlled change, and incremental expansion while minimizing coupling between core domain logic and external infrastructure concerns.
 
@@ -54,16 +54,16 @@ src/
 
 The stack is selected to support strict type safety, modular development, runtime validation, and maintainable backend execution.
 
-| Area | Technology |
-|---|---|
-| **Programming Language** | TypeScript |
-| **Runtime Environment** | Node.js |
-| **Backend Framework** | Fastify |
-| **Schema Validation** | Zod |
-| **Testing Engine** | Native Node.js test runner |
-| **Code Quality and Formatting** | ESLint and Prettier |
-| **Containerization** | Docker |
-| **CI/CD Automation** | GitHub Actions |
+| Area                            | Technology                 |
+| ------------------------------- | -------------------------- |
+| **Programming Language**        | TypeScript                 |
+| **Runtime Environment**         | Node.js                    |
+| **Backend Framework**           | Fastify                    |
+| **Schema Validation**           | Zod                        |
+| **Testing Engine**              | Native Node.js test runner |
+| **Code Quality and Formatting** | ESLint and Prettier        |
+| **Containerization**            | Docker                     |
+| **CI/CD Automation**            | GitHub Actions             |
 
 ---
 
@@ -83,12 +83,12 @@ Operational resilience is a core engineering priority. Janesis Core is designed 
 
 Automated verification is central to the development lifecycle. The CI workflow is structured to enforce quality standards, detect potential secret exposure, and validate application and container builds.
 
-| Pipeline Job | Objective |
-|---|---|
-| `secrets-scan` | Scans for accidentally exposed secrets, hardcoded keys, and credentials. |
-| `verify` | Runs automated formatting, linting, type-checking, and test verification. |
-| `docker` | Validates container image construction and build consistency. |
-| `ci-ok` | Consolidates pipeline outcomes into a single integration status. |
+| Pipeline Job   | Objective                                                                 |
+| -------------- | ------------------------------------------------------------------------- |
+| `secrets-scan` | Scans for accidentally exposed secrets, hardcoded keys, and credentials.  |
+| `verify`       | Runs automated formatting, linting, type-checking, and test verification. |
+| `docker`       | Validates container image construction and build consistency.             |
+| `ci-ok`        | Consolidates pipeline outcomes into a single integration status.          |
 
 The workflow supports repeatable verification, early defect detection, and regression control. CI verification and production deployment are distinct concerns, with deployment and rollout processes managed separately.
 
@@ -98,14 +98,14 @@ The workflow supports repeatable verification, early defect detection, and regre
 
 Quality assurance is integrated into the Janesis Core development lifecycle, with automated checks covering code quality, type safety, test coverage, build integrity, and dependency security. These controls promote consistent engineering standards, support regression prevention, and strengthen the reliability of every change.
 
-| Quality Gate | Verification Tooling |
-| :--- | :--- |
-| **Code Formatting** | Prettier |
-| **Static Analysis** | ESLint |
-| **Type Safety** | TypeScript compiler |
-| **Automated Testing** | Native Node.js test runner and coverage tooling |
-| **Build Validation** | Project build pipeline |
-| **Dependency Security** | Automated dependency audit |
+| Quality Gate            | Verification Tooling                            |
+| :---------------------- | :---------------------------------------------- |
+| **Code Formatting**     | Prettier                                        |
+| **Static Analysis**     | ESLint                                          |
+| **Type Safety**         | TypeScript compiler                             |
+| **Automated Testing**   | Native Node.js test runner and coverage tooling |
+| **Build Validation**    | Project build pipeline                          |
+| **Dependency Security** | Automated dependency audit                      |
 
 Quality controls support repeatable verification, early defect detection, and consistent engineering standards throughout development.
 
@@ -137,4 +137,3 @@ This documentation presents the platform's architecture and engineering approach
 6. **Continuous Evolution** — Strengthen the platform through iterative engineering, verification, and architectural review.
 
 ---
-
