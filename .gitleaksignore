@@ -1,0 +1,3 @@
+# Fake PEM header used as a test fixture (literal form, since replaced by string concatenation).
+# Verified as a placeholder, not a real key. Introduced in b99557837.
+b99557837a6e11f3ee35b46be6050ee1d5be27e7:tests/domain/shared/errors/error-details-limits.test.ts:private-key:92

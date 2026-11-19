@@ -1,0 +1,827 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CI: true
+  GITLEAKS_VERSION: 8.21.2
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  secrets-scan:
+    name: secrets-scan (gitleaks)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # TODO(pin): replace version tags with reviewed commit SHAs before this workflow is required.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks (pinned version, checksum verified)
+        id: install
+        continue-on-error: true
+        run: |
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o gitleaks.tar.gz "${base}/${archive}"
+          curl -fsSL -o checksums.txt "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          expected="$(grep -E "${archive}\$" checksums.txt | cut -d' ' -f1)"
+          test -n "${expected}"
+          echo "${expected}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks version
+      - name: Scan full git history
+        id: scan
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        run: |
+          mkdir -p "$RUNNER_TEMP/ci"
+          ./gitleaks detect --source . --redact --verbose --exit-code 1 --report-format sarif --report-path gitleaks.sarif 2>&1 | tee "$RUNNER_TEMP/ci/gitleaks.log"
+      - name: Upload redacted report on failure
+        if: steps.scan.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: gitleaks.sarif
+      - name: Job summary
+        if: ${{ !cancelled() }}
+        env:
+          INSTALL: ${{ steps.install.outcome }}
+          SCAN: ${{ steps.scan.outcome }}
+        run: |
+          set +e
+          status() {
+            case "$1" in
+              success) echo "VERIFIED" ;;
+              failure) echo "FAILED" ;;
+              *) echo "NOT VERIFIED" ;;
+            esac
+          }
+          version="$(./gitleaks version 2>/dev/null || echo unknown)"
+          commits="$(git rev-list --count HEAD 2>/dev/null || echo unknown)"
+          findings="not available"
+          if [ -f gitleaks.sarif ]; then
+            findings="$(jq '[.runs[].results[]?] | length' gitleaks.sarif 2>/dev/null || echo 'not available')"
+          fi
+          install_detail="not completed"
+          if [ "$INSTALL" = success ]; then
+            install_detail="gitleaks ${version}, SHA-256 verified against the release checksums"
+          fi
+          scan_detail="not run because the install did not succeed"
+          if [ "$SCAN" = success ] || [ "$SCAN" = failure ]; then
+            scan_detail="${commits} commits reachable from HEAD scanned; findings: ${findings}; secrets are redacted in all output"
+          fi
+          {
+            echo "## Secrets scan (gitleaks)"
+            echo
+            echo "| Gate | Status | Detail |"
+            echo "| --- | --- | --- |"
+            echo "| Install pinned gitleaks | $(status "$INSTALL") | ${install_detail} |"
+            echo "| Scan full git history | $(status "$SCAN") | ${scan_detail} |"
+            echo
+            echo "Commit: \`${GITHUB_SHA}\` on \`${GITHUB_REF_NAME}\`"
+            if [ "$SCAN" = failure ] && [ -f "$RUNNER_TEMP/ci/gitleaks.log" ]; then
+              echo
+              echo "<details><summary>Redacted findings (last 60 lines)</summary>"
+              echo
+              echo '```text'
+              tail -n 60 "$RUNNER_TEMP/ci/gitleaks.log" | sed 's/\x1b\[[0-9;]*m//g'
+              echo '```'
+              echo
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$INSTALL" = failure ] || [ "$SCAN" = failure ]; then
+            exit 1
+          fi
+
+  dependency-security:
+    name: dependency-security (npm audit)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # TODO(pin): replace version tags with reviewed commit SHAs before this workflow is required.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Prepare log directory
+        run: mkdir -p "$RUNNER_TEMP/ci"
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: package.json
+      - name: Require a committed lockfile
+        id: lockfile
+        continue-on-error: true
+        run: |
+          test -f package-lock.json || {
+            echo "package-lock.json is missing. Run npm install locally and commit it." >&2
+            exit 1
+          }
+      - name: Dependency audit (high and above)
+        id: audit
+        if: steps.lockfile.outcome == 'success'
+        continue-on-error: true
+        run: npm audit --audit-level=high 2>&1 | tee "$RUNNER_TEMP/ci/audit.log"
+      - name: Dependency audit counts
+        if: steps.lockfile.outcome == 'success'
+        continue-on-error: true
+        run: npm audit --json > "$RUNNER_TEMP/ci/audit.json" || true
+      - name: Job summary
+        if: ${{ !cancelled() }}
+        env:
+          LOCKFILE: ${{ steps.lockfile.outcome }}
+          AUDIT: ${{ steps.audit.outcome }}
+        run: |
+          set +e
+          logs="$RUNNER_TEMP/ci"
+          status() {
+            case "$1" in
+              success) echo "VERIFIED" ;;
+              failure) echo "FAILED" ;;
+              *) echo "NOT VERIFIED" ;;
+            esac
+          }
+          detail=""
+          if [ -s "$logs/audit.json" ]; then
+            detail="$(jq -r '.metadata.vulnerabilities | "\(.total) total (critical \(.critical), high \(.high), moderate \(.moderate), low \(.low), info \(.info)); the gate fails at high or above"' "$logs/audit.json" 2>/dev/null)"
+          fi
+          detail="${detail:-$(grep -v '^$' "$logs/audit.log" 2>/dev/null | tail -n 1)}"
+          detail="${detail:-no audit output was captured}"
+          {
+            echo "## Dependency security"
+            echo
+            echo "| Gate | Status | Detail |"
+            echo "| --- | --- | --- |"
+            echo "| Committed lockfile | $(status "$LOCKFILE") | package-lock.json is the resolution authority; CI never regenerates it |"
+            echo "| npm audit --audit-level=high | $(status "$AUDIT") | ${detail} |"
+            echo
+            echo "Commit: \`${GITHUB_SHA}\` on \`${GITHUB_REF_NAME}\`"
+            echo
+            echo "### Not verified by this job"
+            echo
+            echo "- Only known advisories for locked versions are checked; licenses and package provenance are not reviewed."
+          } >> "$GITHUB_STEP_SUMMARY"
+          for outcome in "$LOCKFILE" "$AUDIT"; do
+            if [ "$outcome" = failure ]; then
+              echo "At least one gate failed; see the table above." >&2
+              exit 1
+            fi
+          done
+
+  sast:
+    name: sast (semgrep)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      SEMGREP_IMAGE: semgrep/semgrep:1.185.0
+    steps:
+      # TODO(pin): replace version tags with reviewed commit SHAs before this workflow is required.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Prepare log directory
+        run: mkdir -p "$RUNNER_TEMP/ci"
+      - name: Semgrep Community Edition scan
+        id: scan
+        continue-on-error: true
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$SEMGREP_IMAGE" \
+            semgrep scan --config p/default --metrics=off --error src scripts 2>&1 | tee "$RUNNER_TEMP/ci/semgrep.log"
+      - name: Job summary
+        if: ${{ !cancelled() }}
+        env:
+          SCAN: ${{ steps.scan.outcome }}
+        run: |
+          set +e
+          logs="$RUNNER_TEMP/ci"
+          status() {
+            case "$1" in
+              success) echo "VERIFIED" ;;
+              failure) echo "FAILED" ;;
+              *) echo "NOT VERIFIED" ;;
+            esac
+          }
+          ran="$(grep -E '^Ran [0-9]+' "$logs/semgrep.log" 2>/dev/null | tail -n 1)"
+          findings="$(grep -E 'Findings:|findings' "$logs/semgrep.log" 2>/dev/null | tail -n 1 | sed 's/^ *//')"
+          {
+            echo "## SAST (Semgrep Community Edition)"
+            echo
+            echo "| Gate | Status | Detail |"
+            echo "| --- | --- | --- |"
+            echo "| Semgrep scan of src and scripts | $(status "$SCAN") | image ${SEMGREP_IMAGE}; ${ran:-no run summary captured}; ${findings:-no findings line captured} |"
+            echo
+            echo "Commit: \`${GITHUB_SHA}\` on \`${GITHUB_REF_NAME}\`"
+            echo
+            echo "### Not verified by this job"
+            echo
+            echo "- Community Edition rules only: no cross-file taint analysis, no commercial rules, no runtime testing."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$SCAN" = failure ]; then
+            echo "The Semgrep scan failed; see the step output." >&2
+            exit 1
+          fi
+
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # TODO(pin): replace version tags with reviewed commit SHAs before this workflow is required.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Prepare log directory
+        run: mkdir -p "$RUNNER_TEMP/ci"
+      - name: Require a committed lockfile
+        id: lockfile
+        continue-on-error: true
+        run: |
+          test -f package-lock.json || {
+            echo "package-lock.json is missing. Run npm install locally and commit it." >&2
+            exit 1
+          }
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: package.json
+          cache: npm
+      - name: Install from the lockfile
+        id: install
+        continue-on-error: true
+        run: npm ci 2>&1 | tee "$RUNNER_TEMP/ci/install.log"
+      - name: Format check
+        id: format
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        run: npm run format:check 2>&1 | tee "$RUNNER_TEMP/ci/format.log"
+      - name: Lint and boundary rules
+        id: lint
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        run: npm run lint 2>&1 | tee "$RUNNER_TEMP/ci/lint.log"
+      - name: Type check
+        id: typecheck
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        run: npm run typecheck 2>&1 | tee "$RUNNER_TEMP/ci/typecheck.log"
+      - name: Production build
+        id: build
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        run: npm run build 2>&1 | tee "$RUNNER_TEMP/ci/build.log"
+      - name: Job summary
+        if: ${{ !cancelled() }}
+        env:
+          LOCKFILE: ${{ steps.lockfile.outcome }}
+          INSTALL: ${{ steps.install.outcome }}
+          FORMAT: ${{ steps.format.outcome }}
+          LINT: ${{ steps.lint.outcome }}
+          TYPECHECK: ${{ steps.typecheck.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+        run: |
+          set +e
+          status() {
+            case "$1" in
+              success) echo "VERIFIED" ;;
+              failure) echo "FAILED" ;;
+              *) echo "NOT VERIFIED" ;;
+            esac
+          }
+          pinned="$(jq -r '.engines.node' package.json 2>/dev/null || echo unknown)"
+          node_now="$(node -v 2>/dev/null || echo unavailable)"
+          node_note="differs from the pinned version"
+          if [ "$node_now" = "v${pinned}" ]; then node_note="matches the pinned version"; fi
+          dist_files="$(find dist -type f 2>/dev/null | wc -l | tr -d ' ')"
+          dist_kib="$(du -sk dist 2>/dev/null | cut -f1)"
+          {
+            echo "## Code quality"
+            echo
+            echo "Node ${node_now} (${node_note}; pinned ${pinned}). Commit: \`${GITHUB_SHA}\` on \`${GITHUB_REF_NAME}\`"
+            echo
+            echo "| Gate | Status | Detail |"
+            echo "| --- | --- | --- |"
+            echo "| Committed lockfile | $(status "$LOCKFILE") | package-lock.json present |"
+            echo "| Install from lockfile (npm ci) | $(status "$INSTALL") | dependencies installed exactly as locked |"
+            echo "| Formatting (Prettier, non-mutating) | $(status "$FORMAT") | npm run format:check |"
+            echo "| Lint and boundary rules (ESLint) | $(status "$LINT") | npm run lint |"
+            echo "| Type check (source and tests) | $(status "$TYPECHECK") | npm run typecheck |"
+            echo "| Production build | $(status "$BUILD") | ${dist_files} files, ${dist_kib:-0} KiB in dist/ |"
+            echo
+            echo "### Not verified by this job"
+            echo
+            echo "- Test results come from unit-tests, integration-tests and architecture-tests; advisories from dependency-security."
+          } >> "$GITHUB_STEP_SUMMARY"
+          for outcome in "$LOCKFILE" "$INSTALL" "$FORMAT" "$LINT" "$TYPECHECK" "$BUILD"; do
+            if [ "$outcome" = failure ]; then
+              echo "At least one gate failed; see the table above." >&2
+              exit 1
+            fi
+          done
+
+  unit-tests:
+    name: unit-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Deliberately no database service and no TEST_DATABASE_URL or DATABASE_URL.
+    steps:
+      # TODO(pin): replace version tags with reviewed commit SHAs before this workflow is required.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Prepare log directory
+        run: mkdir -p "$RUNNER_TEMP/ci"
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: package.json
+          cache: npm
+      - name: Install from the lockfile
+        id: install
+        continue-on-error: true
+        run: npm ci 2>&1 | tee "$RUNNER_TEMP/ci/install.log"
+      - name: Confirm no database is configured
+        id: nodb
+        continue-on-error: true
+        run: |
+          if [ -n "${TEST_DATABASE_URL:-}" ] || [ -n "${DATABASE_URL:-}" ]; then
+            echo "TEST_DATABASE_URL or DATABASE_URL is set; unit tests must run without a database." >&2
+            exit 1
+          fi
+          echo "TEST_DATABASE_URL and DATABASE_URL are unset"
+      - name: Unit tests with coverage
+        id: tests
+        if: steps.install.outcome == 'success' && steps.nodb.outcome == 'success'
+        continue-on-error: true
+        run: |
+          mapfile -t files < <(find tests -type f -name '*.test.ts' ! -path 'tests/architecture/*' | sort)
+          test "${#files[@]}" -gt 0
+          echo "selected ${#files[@]} files (architecture excluded); names beginning with INTEGRATION: are skipped"
+          node --import tsx --test --test-reporter=spec --experimental-test-coverage \
+            --test-skip-pattern='^INTEGRATION:' "${files[@]}" 2>&1 | tee "$RUNNER_TEMP/ci/tests.log"
+      - name: Job summary
+        if: ${{ !cancelled() }}
+        env:
+          INSTALL: ${{ steps.install.outcome }}
+          NODB: ${{ steps.nodb.outcome }}
+          TESTS: ${{ steps.tests.outcome }}
+        run: |
+          set +e
+          logs="$RUNNER_TEMP/ci"
+          status() {
+            case "$1" in
+              success) echo "VERIFIED" ;;
+              failure) echo "FAILED" ;;
+              *) echo "NOT VERIFIED" ;;
+            esac
+          }
+          count() { grep -E "^ℹ $1 " "$logs/tests.log" 2>/dev/null | tail -n 1 | awk '{print $3}'; }
+          cov="$(grep -E '^ℹ all files' "$logs/tests.log" 2>/dev/null | tail -n 1)"
+          cov_field() { echo "$cov" | awk -F'|' -v n="$1" '{gsub(/ /, "", $n); print $n}'; }
+          todo="0"
+          detail="result lines were not found in the test output"
+          if [ -n "$(count tests)" ]; then
+            todo="$(count todo)"
+            detail="$(count tests) reported by Node: $(count pass) passed, $(count fail) failed, $(count skipped) skipped, ${todo} todo"
+            if [ -n "$cov" ]; then
+              detail="${detail}; coverage: lines $(cov_field 2)%, branches $(cov_field 3)%, functions $(cov_field 4)%"
+            fi
+          fi
+          {
+            echo "## Unit tests"
+            echo
+            echo "| Gate | Status | Detail |"
+            echo "| --- | --- | --- |"
+            echo "| Install from lockfile (npm ci) | $(status "$INSTALL") | dependencies installed exactly as locked |"
+            echo "| No database configured | $(status "$NODB") | TEST_DATABASE_URL and DATABASE_URL are unset |"
+            echo "| Unit tests with coverage | $(status "$TESTS") | ${detail} |"
+            echo
+            echo "Commit: \`${GITHUB_SHA}\` on \`${GITHUB_REF_NAME}\`"
+            echo
+            echo "### Not verified by this job"
+            echo
+            echo "- ${todo} tests are todo stubs for later IADP phases and verify nothing yet."
+            echo "- INTEGRATION: tests run in integration-tests and tests/architecture/ in architecture-tests."
+            echo "- Node counts a file whose tests are all filtered out as one entry, so the total can exceed the real unit test count."
+            echo "- Coverage covers the unit tests only, so it is not comparable with the former combined figure."
+          } >> "$GITHUB_STEP_SUMMARY"
+          for outcome in "$INSTALL" "$NODB" "$TESTS"; do
+            if [ "$outcome" = failure ]; then
+              echo "At least one gate failed; see the table above." >&2
+              exit 1
+            fi
+          done
+
+  integration-tests:
+    name: integration-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      # Disposable CI-only credentials for the throwaway service container below. Not real secrets.
+      TEST_DATABASE_URL: postgres://ci_user:ci_password@localhost:5432/janesis_test
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ci_user
+          POSTGRES_PASSWORD: ci_password
+          POSTGRES_DB: janesis_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci_user -d janesis_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      # TODO(pin): replace version tags with reviewed commit SHAs before this workflow is required.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Prepare log directory
+        run: mkdir -p "$RUNNER_TEMP/ci"
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: package.json
+          cache: npm
+      - name: Install from the lockfile
+        id: install
+        continue-on-error: true
+        run: npm ci 2>&1 | tee "$RUNNER_TEMP/ci/install.log"
+      - name: Discover integration tests
+        id: select
+        continue-on-error: true
+        run: |
+          mapfile -t files < <(grep -rl 'INTEGRATION:' tests --include='*.test.ts' | grep -v '^tests/architecture/' | sort)
+          test "${#files[@]}" -gt 0
+          printf '%s\n' "${files[@]}" > "$RUNNER_TEMP/ci/int-files.txt"
+          declared="$(grep -hE "^test\('INTEGRATION:" "${files[@]}" | awk 'END { print NR+0 }')"
+          test "${declared}" -gt 0
+          echo "declared=${declared}" >> "$GITHUB_OUTPUT"
+          echo "${#files[@]} files declare ${declared} INTEGRATION: tests" | tee "$RUNNER_TEMP/ci/select.log"
+      - name: Integration tests with coverage
+        id: tests
+        if: steps.install.outcome == 'success' && steps.select.outcome == 'success'
+        continue-on-error: true
+        run: |
+          mapfile -t files < "$RUNNER_TEMP/ci/int-files.txt"
+          node --import tsx --test --test-reporter=spec --experimental-test-coverage \
+            --test-name-pattern='^INTEGRATION:' "${files[@]}" 2>&1 | tee "$RUNNER_TEMP/ci/tests.log"
+      - name: Executed tests match declared tests
+        id: counts
+        if: steps.select.outcome == 'success' && steps.tests.outcome != 'skipped'
+        continue-on-error: true
+        env:
+          DECLARED: ${{ steps.select.outputs.declared }}
+        run: |
+          log="$RUNNER_TEMP/ci/tests.log"
+          get() { grep -E "^ℹ $1 " "$log" | tail -n 1 | awk '{print $3}'; }
+          tests="$(get tests)"; pass="$(get pass)"; fail="$(get fail)"; skipped="$(get skipped)"
+          echo "declared ${DECLARED}, executed ${tests}, passed ${pass}, failed ${fail}, skipped ${skipped}" | tee "$RUNNER_TEMP/ci/counts.log"
+          if [ "${tests}" != "${DECLARED}" ] || [ "${pass}" != "${DECLARED}" ] || [ "${fail}" != "0" ] || [ "${skipped}" != "0" ]; then
+            exit 1
+          fi
+      - name: Job summary
+        if: ${{ !cancelled() }}
+        env:
+          INSTALL: ${{ steps.install.outcome }}
+          SELECT: ${{ steps.select.outcome }}
+          TESTS: ${{ steps.tests.outcome }}
+          COUNTS: ${{ steps.counts.outcome }}
+        run: |
+          set +e
+          logs="$RUNNER_TEMP/ci"
+          status() {
+            case "$1" in
+              success) echo "VERIFIED" ;;
+              failure) echo "FAILED" ;;
+              *) echo "NOT VERIFIED" ;;
+            esac
+          }
+          detail() {
+            if [ "$1" = success ] || [ "$1" = failure ]; then
+              tr '\n' ' ' < "$logs/$2.log" 2>/dev/null | sed 's/ *$//' | cut -c1-200
+            else
+              echo "not run because an earlier gate did not succeed"
+            fi
+          }
+          cov="$(grep -E '^ℹ all files' "$logs/tests.log" 2>/dev/null | tail -n 1)"
+          cov_field() { echo "$cov" | awk -F'|' -v n="$1" '{gsub(/ /, "", $n); print $n}'; }
+          cov_detail="coverage not reported"
+          if [ -n "$cov" ]; then
+            cov_detail="coverage of these tests alone: lines $(cov_field 2)%, branches $(cov_field 3)%, functions $(cov_field 4)%"
+          fi
+          {
+            echo "## Integration tests"
+            echo
+            echo "| Gate | Status | Detail |"
+            echo "| --- | --- | --- |"
+            echo "| Install from lockfile (npm ci) | $(status "$INSTALL") | dependencies installed exactly as locked |"
+            echo "| Discover integration tests | $(status "$SELECT") | $(detail "$SELECT" select) |"
+            echo "| Integration tests against PostgreSQL 17 | $(status "$TESTS") | ${cov_detail} |"
+            echo "| Executed count equals declared count | $(status "$COUNTS") | $(detail "$COUNTS" counts) |"
+            echo
+            echo "Commit: \`${GITHUB_SHA}\` on \`${GITHUB_REF_NAME}\`"
+            echo
+            echo "### Not verified by this job"
+            echo
+            echo "- Behavior against Neon, Redis, QStash, R2 or Clerk; the service here is a disposable local PostgreSQL."
+            echo "- Unit-level cases in the same files run in the unit-tests job."
+          } >> "$GITHUB_STEP_SUMMARY"
+          for outcome in "$INSTALL" "$SELECT" "$TESTS" "$COUNTS"; do
+            if [ "$outcome" = failure ]; then
+              echo "At least one gate failed; see the table above." >&2
+              exit 1
+            fi
+          done
+
+  architecture-tests:
+    name: architecture-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # TODO(pin): replace version tags with reviewed commit SHAs before this workflow is required.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Prepare log directory
+        run: mkdir -p "$RUNNER_TEMP/ci"
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: package.json
+          cache: npm
+      - name: Install from the lockfile
+        id: install
+        continue-on-error: true
+        run: npm ci 2>&1 | tee "$RUNNER_TEMP/ci/install.log"
+      - name: Architecture tests
+        id: tests
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        run: |
+          mapfile -t files < <(find tests/architecture -type f -name '*.test.ts' | sort)
+          test "${#files[@]}" -gt 0
+          echo "selected ${#files[@]} files under tests/architecture"
+          node --import tsx --test --test-reporter=spec "${files[@]}" 2>&1 | tee "$RUNNER_TEMP/ci/tests.log"
+      - name: Job summary
+        if: ${{ !cancelled() }}
+        env:
+          INSTALL: ${{ steps.install.outcome }}
+          TESTS: ${{ steps.tests.outcome }}
+        run: |
+          set +e
+          logs="$RUNNER_TEMP/ci"
+          status() {
+            case "$1" in
+              success) echo "VERIFIED" ;;
+              failure) echo "FAILED" ;;
+              *) echo "NOT VERIFIED" ;;
+            esac
+          }
+          count() { grep -E "^ℹ $1 " "$logs/tests.log" 2>/dev/null | tail -n 1 | awk '{print $3}'; }
+          detail="result lines were not found in the test output"
+          if [ -n "$(count tests)" ]; then
+            detail="$(count tests) reported by Node: $(count pass) passed, $(count fail) failed, $(count skipped) skipped, $(count todo) todo"
+          fi
+          {
+            echo "## Architecture tests"
+            echo
+            echo "| Gate | Status | Detail |"
+            echo "| --- | --- | --- |"
+            echo "| Install from lockfile (npm ci) | $(status "$INSTALL") | dependencies installed exactly as locked |"
+            echo "| Architecture tests | $(status "$TESTS") | ${detail} |"
+            echo
+            echo "Commit: \`${GITHUB_SHA}\` on \`${GITHUB_REF_NAME}\`"
+            echo
+            echo "### Not verified by this job"
+            echo
+            echo "- These tests guard established constraints; they do not replace architectural review or approval."
+          } >> "$GITHUB_STEP_SUMMARY"
+          for outcome in "$INSTALL" "$TESTS"; do
+            if [ "$outcome" = failure ]; then
+              echo "At least one gate failed; see the table above." >&2
+              exit 1
+            fi
+          done
+
+  docker:
+    name: docker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # TODO(pin): replace version tags with reviewed commit SHAs before this workflow is required.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Prepare log directory
+        run: mkdir -p "$RUNNER_TEMP/ci"
+      - name: Build image
+        id: build
+        continue-on-error: true
+        run: docker build -t janesis-core:ci . 2>&1 | tee "$RUNNER_TEMP/ci/build.log"
+      - name: Image runs the pinned Node version
+        id: nodever
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: |
+          pinned="v$(jq -r .engines.node package.json)"
+          actual="$(docker run --rm --entrypoint node janesis-core:ci -v)"
+          echo "pinned ${pinned}, image ${actual}" | tee "$RUNNER_TEMP/ci/nodever.log"
+          test "${pinned}" = "${actual}"
+      - name: Image runs as a non-root user
+        id: nonroot
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: |
+          uid="$(docker run --rm --entrypoint id janesis-core:ci -u)"
+          echo "uid ${uid}" | tee "$RUNNER_TEMP/ci/nonroot.log"
+          test "${uid}" != "0"
+      - name: Fails fast when APP_ENV is missing
+        id: failfast
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set +e
+          output="$(docker run --rm janesis-core:ci 2>&1)"
+          code=$?
+          set -e
+          printf 'exit code %s\n%s\n' "${code}" "${output}" | tee "$RUNNER_TEMP/ci/failfast.log"
+          test "${code}" = "1"
+          echo "${output}" | grep -q 'Invalid configuration: .*APP_ENV'
+      - name: Start container
+        id: start
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: docker run -d --name smoke -e APP_ENV=development -p 8080:8080 janesis-core:ci 2>&1 | sed 's/^/container id /' | tee "$RUNNER_TEMP/ci/start.log"
+      - name: Liveness answers 200 on /health
+        id: live
+        if: steps.start.outcome == 'success'
+        continue-on-error: true
+        run: |
+          code="000"
+          for i in $(seq 1 30); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/health || true)"
+            if [ "${code}" = "200" ]; then
+              echo "200 after ${i} attempt(s)" | tee "$RUNNER_TEMP/ci/live.log"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "no 200 within 30 attempts; last status ${code}" | tee "$RUNNER_TEMP/ci/live.log"
+          docker logs smoke
+          exit 1
+      - name: Readiness answers 200 on /ready
+        id: ready
+        if: steps.live.outcome == 'success'
+        continue-on-error: true
+        run: |
+          code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/ready || true)"
+          echo "status ${code}" | tee "$RUNNER_TEMP/ci/ready.log"
+          test "${code}" = "200"
+      - name: Graceful shutdown on SIGTERM
+        id: shutdown
+        if: steps.live.outcome == 'success'
+        continue-on-error: true
+        run: |
+          started="$(date +%s)"
+          docker stop --time 10 smoke > /dev/null
+          elapsed="$(( $(date +%s) - started ))"
+          code="$(docker inspect smoke --format '{{.State.ExitCode}}')"
+          docker logs smoke > "$RUNNER_TEMP/ci/container.log" 2>&1
+          echo "exit code ${code}, stopped in ${elapsed}s" | tee "$RUNNER_TEMP/ci/shutdown.log"
+          test "${code}" = "0"
+          grep -q 'shutdown started' "$RUNNER_TEMP/ci/container.log"
+      - name: Remove container
+        if: always()
+        run: docker rm -f smoke || true
+      - name: Job summary
+        if: ${{ !cancelled() }}
+        env:
+          BUILD: ${{ steps.build.outcome }}
+          NODEVER: ${{ steps.nodever.outcome }}
+          NONROOT: ${{ steps.nonroot.outcome }}
+          FAILFAST: ${{ steps.failfast.outcome }}
+          START: ${{ steps.start.outcome }}
+          LIVE: ${{ steps.live.outcome }}
+          READY: ${{ steps.ready.outcome }}
+          SHUTDOWN: ${{ steps.shutdown.outcome }}
+        run: |
+          set +e
+          logs="$RUNNER_TEMP/ci"
+          status() {
+            case "$1" in
+              success) echo "VERIFIED" ;;
+              failure) echo "FAILED" ;;
+              *) echo "NOT VERIFIED" ;;
+            esac
+          }
+          detail() {
+            if [ "$1" = success ] || [ "$1" = failure ]; then
+              tr '\n' ' ' < "$logs/$2.log" 2>/dev/null | sed 's/ *$//' | cut -c1-200
+            else
+              echo "not run because an earlier gate did not succeed"
+            fi
+          }
+          size_mb="unknown"
+          bytes="$(docker image inspect janesis-core:ci --format '{{.Size}}' 2>/dev/null || true)"
+          if [ -n "$bytes" ]; then size_mb="$(( bytes / 1048576 )) MiB"; fi
+          has_shutdown_log="not checked"
+          if [ -f "$logs/container.log" ]; then
+            if grep -q 'shutdown started' "$logs/container.log"; then has_shutdown_log="present"; else has_shutdown_log="missing"; fi
+          fi
+          {
+            echo "## Docker"
+            echo
+            echo "| Gate | Status | Detail |"
+            echo "| --- | --- | --- |"
+            echo "| Build image | $(status "$BUILD") | image size ${size_mb} |"
+            echo "| Image runs the pinned Node version | $(status "$NODEVER") | $(detail "$NODEVER" nodever) |"
+            echo "| Image runs as a non-root user | $(status "$NONROOT") | $(detail "$NONROOT" nonroot) |"
+            echo "| Fails fast when APP_ENV is missing | $(status "$FAILFAST") | $(detail "$FAILFAST" failfast) |"
+            echo "| Container starts with APP_ENV set | $(status "$START") | $(detail "$START" start) |"
+            echo "| Liveness answers 200 on /health | $(status "$LIVE") | $(detail "$LIVE" live) |"
+            echo "| Readiness answers 200 on /ready | $(status "$READY") | $(detail "$READY" ready) |"
+            echo "| Graceful shutdown on SIGTERM | $(status "$SHUTDOWN") | $(detail "$SHUTDOWN" shutdown); shutdown log line ${has_shutdown_log} |"
+            echo
+            echo "Commit: \`${GITHUB_SHA}\` on \`${GITHUB_REF_NAME}\`"
+            echo
+            echo "### Not verified by this job"
+            echo
+            echo "- Behavior under load, in-flight draining inside a container, and Cloud Run itself. The in-process drain test runs in the unit-tests job."
+          } >> "$GITHUB_STEP_SUMMARY"
+          for outcome in "$BUILD" "$NODEVER" "$NONROOT" "$FAILFAST" "$START" "$LIVE" "$READY" "$SHUTDOWN"; do
+            if [ "$outcome" = failure ]; then
+              echo "At least one gate failed; see the table above." >&2
+              exit 1
+            fi
+          done
+
+  ci-ok:
+    name: ci-ok
+    if: ${{ always() }}
+    needs:
+      - secrets-scan
+      - dependency-security
+      - sast
+      - code-quality
+      - unit-tests
+      - integration-tests
+      - architecture-tests
+      - docker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Summary and gate
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          status() {
+            case "$1" in
+              success) echo "VERIFIED" ;;
+              failure) echo "FAILED" ;;
+              cancelled) echo "CANCELLED" ;;
+              skipped) echo "SKIPPED" ;;
+              *) echo "NOT VERIFIED" ;;
+            esac
+          }
+          expected="architecture-tests code-quality dependency-security docker integration-tests sast secrets-scan unit-tests"
+          if ! echo "$RESULTS" | jq -e 'type == "object"' > /dev/null 2>&1; then
+            echo "RESULTS is not valid JSON or is not a JSON object." >&2
+            exit 1
+          fi
+          actual="$(echo "$RESULTS" | jq -r 'keys | join(" ")')"
+          count="$(echo "$RESULTS" | jq 'length')"
+          {
+            echo "## CI result"
+            echo
+            echo "| Job | Status |"
+            echo "| --- | --- |"
+            echo "$RESULTS" | jq -r 'to_entries[] | "\(.key)\t\(.value.result)"' | while IFS=$'\t' read -r job result; do
+              echo "| ${job} | $(status "$result") |"
+            done
+            echo
+            echo "Commit: \`${GITHUB_SHA}\` on \`${GITHUB_REF_NAME}\`"
+            echo
+            echo "Per-gate detail is in each job's summary."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$count" != "8" ] || [ "$actual" != "$expected" ]; then
+            echo "Expected exactly eight prerequisite results (${expected}); got ${count}: ${actual}" >&2
+            exit 1
+          fi
+          # Every prerequisite must be success: failure, cancelled and skipped all fail the gate.
+          if echo "$RESULTS" | jq -e 'to_entries | all(.value.result == "success") | not' > /dev/null; then
+            echo "One or more required jobs did not succeed." >&2
+            exit 1
+          fi
